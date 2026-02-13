@@ -52,3 +52,5 @@ Notas:
 - Habilitar role based access control en la base de datos vectorial
 - Habilitar access policy para el id de la cuenta principal en el contenedor blob storage:
   storage>containers>blob>access policy
+
+# Prueba
