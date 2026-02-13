@@ -1,6 +1,6 @@
 import logging
 import time
-from typing import List
+from typing import Dict, List, Tuple
 
 import requests
 from azure.ai.formrecognizer import DocumentAnalysisClient
@@ -51,11 +51,22 @@ def _retry(fn, *args, retries: int = _MAX_RETRIES, **kwargs):
 
 
 # ---------------------------------------------------------------------------
-# OCR — Document Intelligence
+# OCR — Document Intelligence (prebuilt-layout for structural metadata)
 # ---------------------------------------------------------------------------
 
-def extract_text_from_bytes(doc_bytes: bytes) -> str:
-    """Extract text from a PDF/Word document using Azure Document Intelligence."""
+def extract_document(doc_bytes: bytes) -> Dict:
+    """Extract structured text from a document using Azure Document Intelligence.
+
+    Uses ``prebuilt-layout`` to obtain paragraph-level metadata including
+    page numbers and structural roles (title, sectionHeading, etc.).
+
+    Returns a dict::
+
+        {
+            "paragraphs": [{"text": str, "page": int, "section": str}, ...],
+            "total_pages": int,
+        }
+    """
     if not DOCUMENT_INTELLIGENCE_ENDPOINT:
         raise ValueError("DOCUMENT_INTELLIGENCE_ENDPOINT not configured")
 
@@ -65,61 +76,126 @@ def extract_text_from_bytes(doc_bytes: bytes) -> str:
     )
 
     def _analyze():
-        poller = client.begin_analyze_document("prebuilt-read", doc_bytes)
+        poller = client.begin_analyze_document("prebuilt-layout", doc_bytes)
         return poller.result()
 
     result = _retry(_analyze)
 
-    text = getattr(result, "content", None)
-    if text:
-        return text
+    total_pages = len(result.pages) if result.pages else 1
 
-    paragraphs: list[str] = []
-    for page in result.pages:
-        for line in page.lines:
-            paragraphs.append(line.content)
-    return "\n".join(paragraphs)
+    paragraphs: List[Dict] = []
+    current_section = ""
+
+    for para in (result.paragraphs or []):
+        page = 1
+        if para.bounding_regions:
+            page = para.bounding_regions[0].page_number
+
+        # Track section headings
+        if para.role in ("title", "sectionHeading"):
+            current_section = para.content
+
+        paragraphs.append({
+            "text": para.content,
+            "page": page,
+            "section": current_section,
+        })
+
+    # Fallback: if no paragraphs, iterate pages/lines
+    if not paragraphs:
+        for page in (result.pages or []):
+            for line in (page.lines or []):
+                paragraphs.append({
+                    "text": line.content,
+                    "page": page.page_number,
+                    "section": "",
+                })
+
+    log.info(
+        "Extracted %d paragraph(s) across %d page(s).",
+        len(paragraphs), total_pages,
+    )
+    return {"paragraphs": paragraphs, "total_pages": total_pages}
 
 
 # ---------------------------------------------------------------------------
-# Text chunking
+# Metadata-aware chunking
 # ---------------------------------------------------------------------------
 
-def chunk_text(text: str, chunk_size: int = CHUNK_SIZE,
-               overlap: int = CHUNK_OVERLAP) -> List[str]:
-    """Split *text* into chunks of approximately *chunk_size* characters with
-    *overlap* characters of context carried over between consecutive chunks.
+def chunk_paragraphs(
+    paragraphs: List[Dict],
+    total_pages: int,
+    chunk_size: int = CHUNK_SIZE,
+    overlap: int = CHUNK_OVERLAP,
+) -> List[Dict]:
+    """Split annotated paragraphs into chunks preserving page/section metadata.
 
-    Splitting is done on whitespace boundaries to avoid cutting words.
+    Each returned chunk is a dict::
+
+        {
+            "text": str,
+            "page_start": int,
+            "page_end": int,
+            "section": str,
+            "total_pages": int,
+        }
     """
-    if not text or not text.strip():
+    if not paragraphs:
         return []
 
-    words = text.split()
-    chunks: List[str] = []
-    current: List[str] = []
+    # Build word-level annotations: (word, page, section)
+    annotated_words: List[Tuple[str, int, str]] = []
+    for para in paragraphs:
+        for w in para["text"].split():
+            annotated_words.append((w, para["page"], para["section"]))
+
+    if not annotated_words:
+        return []
+
+    chunks: List[Dict] = []
+    current: List[Tuple[str, int, str]] = []
     current_len = 0
 
-    for word in words:
-        word_len = len(word) + (1 if current else 0)  # +1 for space
-        if current_len + word_len > chunk_size and current:
-            chunks.append(" ".join(current))
-            # Calculate how many words to keep for overlap
-            overlap_words: List[str] = []
-            overlap_len = 0
-            for w in reversed(current):
-                if overlap_len + len(w) + 1 > overlap:
-                    break
-                overlap_words.insert(0, w)
-                overlap_len += len(w) + 1
-            current = overlap_words
-            current_len = sum(len(w) for w in current) + max(len(current) - 1, 0)
+    for aw in annotated_words:
+        word = aw[0]
+        word_len = len(word) + (1 if current else 0)
 
-        current.append(word)
+        if current_len + word_len > chunk_size and current:
+            # Emit chunk
+            text = " ".join(w for w, _, _ in current)
+            pages = [p for _, p, _ in current]
+            chunks.append({
+                "text": text,
+                "page_start": min(pages),
+                "page_end": max(pages),
+                "section": current[0][2],  # section of first word
+                "total_pages": total_pages,
+            })
+            # Keep overlap words
+            overlap_words: List[Tuple[str, int, str]] = []
+            overlap_len = 0
+            for wt in reversed(current):
+                if overlap_len + len(wt[0]) + 1 > overlap:
+                    break
+                overlap_words.insert(0, wt)
+                overlap_len += len(wt[0]) + 1
+            current = overlap_words
+            current_len = sum(len(w) for w, _, _ in current) + max(len(current) - 1, 0)
+
+        current.append(aw)
         current_len += word_len
 
+    # Last chunk
     if current:
-        chunks.append(" ".join(current))
+        text = " ".join(w for w, _, _ in current)
+        pages = [p for _, p, _ in current]
+        chunks.append({
+            "text": text,
+            "page_start": min(pages),
+            "page_end": max(pages),
+            "section": current[0][2],
+            "total_pages": total_pages,
+        })
 
     return chunks
 

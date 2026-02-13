@@ -5,7 +5,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List
 
 from .blob_utils import list_blobs, download_blob_to_bytes
-from .ocr_foundry import extract_text_from_bytes, get_embeddings_from_foundry, chunk_text
+from .ocr_foundry import extract_document, get_embeddings_from_foundry, chunk_paragraphs
 from .search_indexer import (
     create_index_if_not_exists,
     upsert_documents,
@@ -44,16 +44,20 @@ def _batched(iterable: list, size: int):
 def _build_search_doc(
     blob_name: str,
     chunk_index: int,
-    content: str,
+    chunk: dict,
     embedding: List[float],
 ) -> dict:
     raw_id = f"{blob_name}__chunk_{chunk_index}"
     return {
         "@search.action": "upload",
         "id": _sanitize_id(raw_id),
-        "content": content,
+        "content": chunk["text"],
         "source_blob": blob_name,
         "chunk_index": chunk_index,
+        "page_start": chunk["page_start"],
+        "page_end": chunk["page_end"],
+        "section_heading": chunk["section"],
+        "total_pages": chunk["total_pages"],
         "embedding": embedding,
     }
 
@@ -67,18 +71,21 @@ def _process_blob(blob_name: str) -> List[dict]:
     log.info("Processing: %s", blob_name)
 
     data = download_blob_to_bytes(blob_name)
-    text = extract_text_from_bytes(data)
+    doc_result = extract_document(data)
 
-    if not text or not text.strip():
+    paragraphs = doc_result["paragraphs"]
+    total_pages = doc_result["total_pages"]
+
+    if not paragraphs:
         log.warning("No text extracted from '%s' — skipping.", blob_name)
         return []
 
-    chunks = chunk_text(text)
-    log.info("  '%s' → %d chunk(s)", blob_name, len(chunks))
+    chunks = chunk_paragraphs(paragraphs, total_pages)
+    log.info("  '%s' → %d chunk(s), %d page(s)", blob_name, len(chunks), total_pages)
 
     docs: List[dict] = []
     for idx, chunk in enumerate(chunks):
-        embedding = get_embeddings_from_foundry(chunk)
+        embedding = get_embeddings_from_foundry(chunk["text"])
         if embedding is None:
             log.warning("  Null embedding for chunk %d of '%s' — skipping chunk.", idx, blob_name)
             continue

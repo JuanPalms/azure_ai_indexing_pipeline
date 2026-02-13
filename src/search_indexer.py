@@ -115,6 +115,30 @@ def create_index_if_not_exists():
                 "searchable": False,
             },
             {
+                "name": "page_start",
+                "type": "Edm.Int32",
+                "filterable": True,
+                "searchable": False,
+            },
+            {
+                "name": "page_end",
+                "type": "Edm.Int32",
+                "filterable": True,
+                "searchable": False,
+            },
+            {
+                "name": "section_heading",
+                "type": "Edm.String",
+                "filterable": True,
+                "searchable": True,
+            },
+            {
+                "name": "total_pages",
+                "type": "Edm.Int32",
+                "filterable": True,
+                "searchable": False,
+            },
+            {
                 "name": "embedding",
                 "type": "Collection(Edm.Single)",
                 "searchable": True,
